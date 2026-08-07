@@ -1,98 +1,139 @@
-@Bean
-SecurityFilterChain chain(HttpSecurity http) throws Exception {
+package com.company.sso.api;
 
-    CookieCsrfTokenRepository csrfRepository =
-            CookieCsrfTokenRepository.withHttpOnlyFalse();
-
-    csrfRepository.setCookiePath("/");
-    csrfRepository.setCookieName("XSRF-TOKEN");
-    csrfRepository.setHeaderName("X-XSRF-TOKEN");
-
-    CsrfTokenRequestAttributeHandler requestHandler =
-            new CsrfTokenRequestAttributeHandler();
-
-    requestHandler.setCsrfRequestAttributeName("_csrf");
-
-    return http
-            .cors(Customizer.withDefaults())
-
-            .csrf(csrf -> csrf
-                    .csrfTokenRepository(csrfRepository)
-                    .csrfTokenRequestHandler(requestHandler)
-            )
-
-            .authorizeHttpRequests(auth -> auth
-                    .requestMatchers(
-                            "/actuator/health",
-                            "/login/**",
-                            "/api/auth/csrf",
-                            "/api/auth/bootstrap/**",
-                            "/api/auth/flow/**",
-                            "/api/auth/recovery/**",
-                            "/api/auth/authenticate"
-                    )
-                    .permitAll()
-
-                    .anyRequest()
-                    .permitAll()
-            )
-
-            .headers(headers -> headers
-                    .contentSecurityPolicy(csp -> csp
-                            .policyDirectives(
-                                    "default-src 'self'; " +
-                                    "img-src 'self' data: https:; " +
-                                    "script-src 'self'; " +
-                                    "style-src 'self' 'unsafe-inline'; " +
-                                    "connect-src 'self'; " +
-                                    "frame-ancestors 'none'; " +
-                                    "base-uri 'self'; " +
-                                    "form-action 'self'"
-                            )
-                    )
-            )
-
-            .build();
-}
-
-==================================
-
-  CsrfController.java
-
-  package com.company.sso.api;
-
-import java.util.Map;
-import org.springframework.security.web.csrf.CsrfToken;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
+import com.company.sso.config.AuthProperties;
+import com.company.sso.domain.AuthJourneyContext;
+import com.company.sso.domain.SsoAuthorizationRequest;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpSession;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.*;
 
 @RestController
-@RequestMapping("/api/auth")
-public class CsrfController {
+@RequestMapping("/api/auth/flow")
+public class FlowNavigationController {
 
-    @GetMapping("/csrf")
-    public Map<String, String> csrf(CsrfToken csrfToken) {
-        return Map.of(
-                "token", csrfToken.getToken(),
-                "headerName", csrfToken.getHeaderName(),
-                "parameterName", csrfToken.getParameterName()
+    private final AuthProperties authProperties;
+
+    public FlowNavigationController(
+            AuthProperties authProperties) {
+        this.authProperties = authProperties;
+    }
+
+    @PostMapping("/select")
+    public ApiModels.ActionResponse select(
+            @RequestBody SelectFlowRequest body,
+            HttpServletRequest servletRequest) {
+
+        HttpSession session =
+                servletRequest.getSession(false);
+
+        if (session == null) {
+            throw new ApiException(
+                    HttpStatus.UNAUTHORIZED,
+                    "SESSION_NOT_FOUND",
+                    "Session is not available."
+            );
+        }
+
+        @SuppressWarnings("unchecked")
+        var requests =
+                (java.util.Map<String, SsoAuthorizationRequest>)
+                        session.getAttribute(
+                                "AUTHORIZATION_REQUESTS"
+                        );
+
+        if (requests == null) {
+            throw new ApiException(
+                    HttpStatus.UNAUTHORIZED,
+                    "REQUEST_NOT_FOUND",
+                    "No active SSO requests were found."
+            );
+        }
+
+        SsoAuthorizationRequest request =
+                requests.get(body.requestId());
+
+        if (request == null) {
+            throw new ApiException(
+                    HttpStatus.NOT_FOUND,
+                    "REQUEST_NOT_FOUND",
+                    "The SSO request was not found."
+            );
+        }
+
+        String realm = request.realm();
+
+        var realmConfig =
+                authProperties.realms().get(realm);
+
+        if (realmConfig == null) {
+            throw new ApiException(
+                    HttpStatus.BAD_REQUEST,
+                    "UNKNOWN_REALM",
+                    "The realm is not configured."
+            );
+        }
+
+        String requestedFlow =
+                body.flow().toUpperCase();
+
+        boolean enabled = switch (requestedFlow) {
+            case "FORGOT_PASSWORD" ->
+                    realmConfig.flows().forgotPassword();
+
+            case "FORGOT_USERNAME" ->
+                    realmConfig.flows().forgotUsername();
+
+            case "AUTHENTICATE" ->
+                    realmConfig.flows().authenticate();
+
+            default -> false;
+        };
+
+        if (!enabled) {
+            throw new ApiException(
+                    HttpStatus.FORBIDDEN,
+                    "FLOW_NOT_ALLOWED",
+                    "The requested flow is not enabled for this realm."
+            );
+        }
+
+        AuthJourneyContext journey =
+                new AuthJourneyContext(
+                        body.requestId(),
+                        realm,
+                        request.clientId(),
+                        requestedFlow
+                );
+
+        @SuppressWarnings("unchecked")
+        java.util.Map<String, AuthJourneyContext> journeys =
+                (java.util.Map<String, AuthJourneyContext>)
+                        session.getAttribute("AUTH_JOURNEYS");
+
+        if (journeys == null) {
+            journeys = new java.util.HashMap<>();
+        } else {
+            journeys = new java.util.HashMap<>(journeys);
+        }
+
+        journeys.put(body.requestId(), journey);
+
+        session.setAttribute(
+                "AUTH_JOURNEYS",
+                journeys
+        );
+
+        return new ApiModels.ActionResponse(
+                body.requestId(),
+                requestedFlow,
+                java.util.Map.of()
         );
     }
+
+    public record SelectFlowRequest(
+            String requestId,
+            String flow
+    ) {
+    }
 }
-
-===================
-
-  import axios from "axios";
-
-export const apiClient = axios.create({
-  baseURL: "/api",
-  withCredentials: true,
-  xsrfCookieName: "XSRF-TOKEN",
-  xsrfHeaderName: "X-XSRF-TOKEN",
-  headers: {
-    "Content-Type": "application/json",
-  },
-});
-
-=======================
