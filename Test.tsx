@@ -1,65 +1,101 @@
-import type {
-  ApiError,
-} from "@company/sso-auth-core";
+type Args = {
+  error: any;
 
+  setUsernameError: (message: string) => void;
+  setPasswordError: (message: string) => void;
+  setLoginError: (message: string) => void;
 
-type Props = {
-  error: ApiError;
-  onRetry?: () => void;
+  onError: (error: unknown) => void;
 };
 
-
-export function ServiceError({
+export function handleAuthenticateError({
   error,
-  onRetry,
-}: Props) {
+  setUsernameError,
+  setPasswordError,
+  setLoginError,
+  onError,
+}: Args): void {
+
+  const status =
+    error?.response?.status;
+
+  const data =
+    error?.response?.data;
+
+  const code =
+    data?.code;
 
   const message =
-    typeof error?.message === "string"
-      ? error.message
-      : "Something went wrong. Please try again.";
+    data?.message;
+
+  const fieldErrors =
+    data?.fieldErrors;
 
 
-  const trackingId =
-    typeof error?.trackingId === "string"
-      ? error.trackingId
-      : undefined;
+  // 1. BACKEND FIELD VALIDATION
+  if (code === "VALIDATION_ERROR") {
+
+    if (fieldErrors?.username) {
+      setUsernameError(
+        fieldErrors.username
+      );
+    }
+
+    if (fieldErrors?.password) {
+      setPasswordError(
+        fieldErrors.password
+      );
+    }
+
+    // Validation error without
+    // specific field errors
+    if (
+      !fieldErrors?.username &&
+      !fieldErrors?.password
+    ) {
+      setLoginError(
+        typeof message === "string"
+          ? message
+          : "Please check your information."
+      );
+    }
+
+    return;
+  }
 
 
-  return (
+  // 2. INVALID CREDENTIALS
+  if (
+    status === 401 ||
+    code === "INVALID_CREDENTIALS"
+  ) {
 
-    <div role="alert">
+    setLoginError(
+      typeof message === "string"
+        ? message
+        : "Username or password is incorrect."
+    );
 
-      <h2>
-        Unable to continue
-      </h2>
-
-
-      <p>
-        {message}
-      </p>
-
-
-      {trackingId && (
-
-        <p>
-          Reference ID: {trackingId}
-        </p>
-
-      )}
+    return;
+  }
 
 
-      {onRetry && (
+  // 3. ACCOUNT LOCKED
+  if (
+    status === 423 ||
+    code === "ACCOUNT_LOCKED"
+  ) {
 
-        <button
-          type="button"
-          onClick={onRetry}
-        >
-          Try Again
-        </button>
+    setLoginError(
+      typeof message === "string"
+        ? message
+        : "Your account is locked."
+    );
 
-      )}
+    return;
+  }
 
-    </div>
-  );
+
+  // 4. SYSTEM / SERVICE ERROR
+  onError(error);
 }
