@@ -1,854 +1,1346 @@
-# GitHub Copilot Implementation Guide — SSO Request Correlation & Splunk-Friendly Logging
+# GitHub Copilot Task — Clean Up SSO MDC Correlation Ownership
 
-## Goal
+## Objective
 
-Enhance the existing `sso-backend` so every SSO journey can be traced end-to-end in Splunk using one `requestId`, while each individual HTTP call has its own `trackingId`.
+Refactor the existing SSO logging/MDC implementation so correlation fields are populated in one clear place, without duplicate writes, while preserving all existing authentication/session/flow behavior.
 
-Splunk and Logback are already configured. **Do not change Splunk or Logback configuration.** Focus only on code changes for correlation, MDC, stable event codes, flow lifecycle logging, external-service logging, safe user correlation, centralized error logging, session/context reuse logging, and tests.
-
-## 1. Correlation model
-
-Use these identifiers consistently:
-
-- `requestId` = one complete SSO authorization journey. It is already generated in the existing SSO `start(...)` method. Reuse the same `requestId` for bootstrap, authenticate, flow/select, forgot password, forgot username, password expired, missing profile, Transmit, and final completion.
-- `trackingId` = one individual HTTP request. Reuse incoming `X-Tracking-Id` if present; otherwise generate a UUID. Return it in response header `X-Tracking-Id`.
-- `realm` = BCA / CCA / RCA / IHH / TTM etc.
-- `clientId` = relying-party client ID.
-- `flow` = existing backend `Flow` enum value.
-
-Do **not** use the HTTP session ID as the Splunk business correlation key.
-
-## 2. Create/extend logging package
-
-Use:
+This task is specifically based on the current code in:
 
 ```text
-src/main/java/com/company/sso/logging/
-```
-
-Target classes:
-
-```text
+SsoEntryController.java
+AuthenticationService.java
 RequestTrackingFilter.java
-SsoLogContext.java
-SsoEventCode.java
-SsoEventLogger.java
-UserKeyGenerator.java
-LogSanitizer.java
+MdcContextService.java
 ```
 
-Before creating anything, search the codebase for existing MDC/tracking/sanitizer utilities. Reuse or extend them instead of creating duplicate infrastructure.
+Splunk and Logback are already configured. Do not change Splunk or Logback configuration.
 
-## 3. Stable event codes
+---
 
-Create `SsoEventCode.java`:
+# Current behavior observed
+
+## `RequestTrackingFilter`
+
+Current filter already:
+
+- reads `X-Tracking-Id`
+- falls back to a legacy transaction header
+- generates UUID if missing
+- stores tracking ID in MDC
+- stores HTTP method/path in MDC
+- returns tracking ID in response header
+- clears filter/business MDC in `finally`
+
+This behavior should remain.
+
+## `SsoEntryController`
+
+Current controller does approximately:
 
 ```java
-package com.company.sso.logging;
+mdc.applyJourneyContext(null, realm, clientId);
 
-public enum SsoEventCode {
-    SSO_REQUEST_STARTED,
-    SSO_REQUEST_CREATED,
-    SSO_REQUEST_COMPLETED,
-    SSO_REQUEST_FAILED,
+SsoRequest r = service.start(
+        req,
+        clientId,
+        redirectUri,
+        realm,
+        state,
+        scope,
+        responseType
+);
 
-    BOOTSTRAP_STARTED,
-    BOOTSTRAP_RESOLVED,
+mdc.applyRequestContext(r);
 
-    FLOW_STARTED,
-    FLOW_COMPLETED,
-    FLOW_FAILED,
-
-    EXTERNAL_CALL_STARTED,
-    EXTERNAL_CALL_COMPLETED,
-    EXTERNAL_CALL_FAILED,
-
-    SESSION_CREATED,
-    SESSION_REUSED,
-    REALM_CONTEXT_REUSED,
-    CROSS_REALM_CONTEXT_REUSED,
-    REMEMBER_ME_RESTORED,
-    REQUEST_CONTEXT_BOUND,
-
-    SECURITY_EVENT,
-    SYSTEM_ERROR
-}
+log.info("SSO session request created");
 ```
 
-Do not let developers invent multiple text variants such as `Login success`, `Successful login`, `Authentication passed`. Dashboards should rely on stable event codes.
+## `AuthenticationService.start(...)`
 
-## 4. RequestTrackingFilter
-
-Implement or extend a `OncePerRequestFilter`.
-
-Requirements:
-
-- Read `X-Tracking-Id`.
-- If missing/blank, create UUID.
-- Put into MDC as `trackingId`.
-- Put HTTP method in MDC as `httpMethod`.
-- Put request URI in MDC as `requestPath`.
-- Set response header `X-Tracking-Id`.
-- Clear only keys owned by the filter in `finally`.
-- Never put cookies, authorization headers, credentials, CSRF tokens, or request bodies into MDC.
-
-Suggested implementation:
+Current service does approximately:
 
 ```java
-@Component
-public class RequestTrackingFilter extends OncePerRequestFilter {
+HttpSession existingSession = req.getSession(false);
 
-    public static final String TRACKING_ID = "trackingId";
-    public static final String TRACKING_HEADER = "X-Tracking-Id";
-
-    @Override
-    protected void doFilterInternal(
-            HttpServletRequest request,
-            HttpServletResponse response,
-            FilterChain filterChain)
-            throws ServletException, IOException {
-
-        String trackingId = request.getHeader(TRACKING_HEADER);
-
-        if (trackingId == null || trackingId.isBlank()) {
-            trackingId = UUID.randomUUID().toString();
-        }
-
-        try {
-            MDC.put(TRACKING_ID, trackingId);
-            MDC.put("httpMethod", request.getMethod());
-            MDC.put("requestPath", request.getRequestURI());
-
-            response.setHeader(TRACKING_HEADER, trackingId);
-            filterChain.doFilter(request, response);
-        } finally {
-            MDC.remove(TRACKING_ID);
-            MDC.remove("httpMethod");
-            MDC.remove("requestPath");
-        }
-    }
-}
-```
-
-## 5. SsoLogContext
-
-Create a utility for business correlation MDC fields:
-
-```java
-public final class SsoLogContext {
-
-    private SsoLogContext() {}
-
-    public static void setRequest(
-            String requestId,
-            String realm,
-            String clientId) {
-        put("requestId", requestId);
-        put("realm", realm);
-        put("clientId", clientId);
-    }
-
-    public static void setFlow(String flow) {
-        put("flow", flow);
-    }
-
-    public static void setUserKey(String userKey) {
-        put("userKey", userKey);
-    }
-
-    public static void setExternalService(String service) {
-        put("externalService", service);
-    }
-
-    private static void put(String key, String value) {
-        if (value != null && !value.isBlank()) {
-            MDC.put(key, value);
-        }
-    }
-
-    public static void clearBusinessContext() {
-        MDC.remove("requestId");
-        MDC.remove("realm");
-        MDC.remove("clientId");
-        MDC.remove("flow");
-        MDC.remove("userKey");
-        MDC.remove("externalService");
-    }
-}
-```
-
-Do not clear `trackingId` here; the filter owns it.
-
-## 6. Privacy-safe userKey
-
-Do not send raw username/email to Splunk unless company policy explicitly allows it.
-
-Create a stable one-way `userKey` using SHA-256:
-
-```java
-@Component
-public class UserKeyGenerator {
-
-    public String generate(String username) {
-        if (username == null || username.isBlank()) {
-            return null;
-        }
-
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(
-                    username.trim()
-                            .toLowerCase()
-                            .getBytes(StandardCharsets.UTF_8)
-            );
-
-            return "USR-" +
-                    HexFormat.of()
-                            .formatHex(hash)
-                            .substring(0, 16);
-        } catch (Exception ex) {
-            throw new IllegalStateException("Unable to generate user key", ex);
-        }
-    }
-}
-```
-
-Never log:
-
-```text
-password
-newPassword
-confirmPassword
-OTP
-security answer
-access token
-refresh token
-authorization code
-remember-me token
-CSRF token
-SSOSESSION cookie/session id
-full sensitive request/response payloads
-```
-
-## 7. LogSanitizer
-
-Create or extend an existing sanitizer to redact keys/names matching at least:
-
-```text
-password
-newPassword
-confirmPassword
-otp
-token
-accessToken
-refreshToken
-authorization
-cookie
-sessionId
-csrf
-secret
-securityAnswer
-```
-
-Preferred replacement:
-
-```text
-[REDACTED]
-```
-
-Do not log full authentication payloads and rely on sanitization as a primary protection. Prefer not logging them at all.
-
-## 8. SsoEventLogger
-
-Create a reusable business event logger. Common correlation fields should come from MDC.
-
-Required event methods:
-
-```java
-requestStarted()
-requestCreated()
-requestCompleted(long durationMs)
-requestFailed(String errorCode, long durationMs)
-bootstrapStarted()
-bootstrapResolved(Flow flow)
-flowStarted(Flow flow)
-flowCompleted(Flow flow, long durationMs)
-flowFailed(Flow flow, String errorCode, long durationMs)
-externalCallStarted(String service, String operation)
-externalCallCompleted(String service, String operation, long durationMs)
-externalCallFailed(String service, String operation, String errorCode, long durationMs)
-sessionCreated()
-sessionReused()
-realmContextReused(String sourceRealm)
-crossRealmContextReused(String sourceRealm, String targetRealm)
-rememberMeRestored()
-systemError(String errorCode, Throwable throwable)
-```
-
-Example style:
-
-```java
-@Component
-public class SsoEventLogger {
-
-    private static final Logger log =
-            LoggerFactory.getLogger(SsoEventLogger.class);
-
-    public void requestCreated() {
-        log.info(
-                "eventCode={} result=SUCCESS",
-                SsoEventCode.SSO_REQUEST_CREATED
-        );
-    }
-
-    public void bootstrapResolved(Flow flow) {
-        log.info(
-                "eventCode={} result=SUCCESS nextAction={}",
-                SsoEventCode.BOOTSTRAP_RESOLVED,
-                flow
-        );
-    }
-
-    public void flowStarted(Flow flow) {
-        log.info(
-                "eventCode={} flow={} result=STARTED",
-                SsoEventCode.FLOW_STARTED,
-                flow
-        );
-    }
-
-    public void flowCompleted(Flow flow, long durationMs) {
-        log.info(
-                "eventCode={} flow={} result=SUCCESS durationMs={}",
-                SsoEventCode.FLOW_COMPLETED,
-                flow,
-                durationMs
-        );
-    }
-
-    public void flowFailed(
-            Flow flow,
-            String errorCode,
-            long durationMs) {
-        log.warn(
-                "eventCode={} flow={} result=FAILED errorCode={} durationMs={}",
-                SsoEventCode.FLOW_FAILED,
-                flow,
-                errorCode,
-                durationMs
-        );
-    }
-}
-```
-
-Use existing safe error codes from the project instead of inventing duplicate codes.
-
-## 9. Modify existing SSO start(...)
-
-Current logic already roughly does:
-
-```java
 realm = policy.normalize(realm);
-policy.validateClient(realm, client, redirect);
-HttpSession s = req.getSession(true);
-repo.cleanupExpired(s);
+
+policy.validateClient(
+        realm,
+        client,
+        redirect
+);
+
+HttpSession session = req.getSession(true);
+
+if (existingSession == null) {
+    eventLogger.sessionCreated();
+} else {
+    eventLogger.sessionReused();
+}
+
+repo.cleanupExpired(session);
+
 String id = UUID.randomUUID().toString();
+
+mdc.applyJourneyContext(
+        id,
+        realm,
+        client
+);
+
+SsoLogContext.setRequest(
+        id,
+        realm,
+        client,
+        mdc
+);
+
 Instant now = Instant.now();
+
 SsoRequest r = new SsoRequest(...);
-repo.saveRequest(s, r);
+
+repo.saveRequest(session, r);
+
+eventLogger.requestCreated();
+
 return r;
 ```
 
-Keep functional behavior unchanged.
-
-Add:
-
-1. Detect whether session existed before `getSession(true)`.
-2. Log `SESSION_CREATED` or `SESSION_REUSED`.
-3. Continue generating a new `requestId` on every `/ssoAuthenticate` call.
-4. Put `requestId`, `realm`, and `clientId` into MDC.
-5. Log `SSO_REQUEST_CREATED`.
-6. Never log session ID.
-
-Suggested pattern:
-
-```java
-HttpSession existing = req.getSession(false);
-boolean hadSession = existing != null;
-
-HttpSession s = req.getSession(true);
-
-String id = UUID.randomUUID().toString();
-
-SsoLogContext.setRequest(id, realm, client);
-
-if (hadSession) {
-    eventLogger.sessionReused();
-} else {
-    eventLogger.sessionCreated();
-}
-
-// existing request creation logic
-repo.saveRequest(s, r);
-eventLogger.requestCreated();
-```
-
-Do not invalidate an existing session because a new SSO request arrives.
-
-## 10. Modify existing bootstrap(...)
-
-The existing `AuthenticationService.bootstrap(...)` already performs this sequence:
+There is duplicate MDC population between:
 
 ```text
-getSession(false)
-cleanupExpired
-activeJourney(requestId)
-requestUser(requestId)
-validRealmUser(session, realm)
-reuseFromAllowedRealm(session, request)
-remember.restore(...)
-AUTHENTICATE if no context
-bindRequestUser(...)
-nextFor(user)
+mdc.applyJourneyContext(...)
+SsoLogContext.setRequest(...)
+mdc.applyRequestContext(r)
 ```
 
-Keep that logic unchanged.
+The goal is to simplify this.
 
-At beginning:
+---
+
+# Required design
+
+Use this ownership model:
+
+```text
+RequestTrackingFilter
+    owns:
+        trackingId
+        httpMethod
+        requestPath
+
+SsoEntryController
+    may temporarily set:
+        realm
+        clientId
+        requestId = null
+
+AuthenticationService.start(...)
+    owns setting the real:
+        requestId
+        realm
+        clientId
+
+Other service methods
+    update:
+        flow
+        userKey
+        externalService
+```
+
+---
+
+# 1. Keep `RequestTrackingFilter` behavior
+
+Do not change functional behavior unless needed for cleanup.
+
+The filter should continue to:
 
 ```java
-SsoLogContext.setRequest(
-        r.requestId(),
-        r.realm(),
-        r.clientId()
+String trackingId = request.getHeader(TRACKING_HEADER);
+
+if (trackingId == null || trackingId.isBlank()) {
+    trackingId = request.getHeader(
+            LEGACY_HEADER_TRANSACTION_ID
+    );
+}
+
+if (trackingId == null || trackingId.isBlank()) {
+    trackingId = UUID.randomUUID().toString();
+}
+
+mdc.putTrackId(trackingId);
+
+mdc.setHttpRequest(
+        request.getMethod(),
+        request.getRequestURI()
 );
 
-eventLogger.bootstrapStarted();
-```
+response.setHeader(
+        TRACKING_HEADER,
+        trackingId
+);
 
-For every return path, log the resolved next action.
-
-Example:
-
-```java
-Flow next = activeJourney.get().nextAction();
-SsoLogContext.setFlow(next.name());
-eventLogger.bootstrapResolved(next);
-return next;
-```
-
-Same-realm reuse:
-
-```java
-eventLogger.realmContextReused(r.realm());
-```
-
-Cross-realm reuse:
-
-```java
-eventLogger.crossRealmContextReused(
-        sourceRealm,
-        r.realm()
+filterChain.doFilter(
+        request,
+        response
 );
 ```
 
-Remember-me restore:
+In `finally`, clear MDC:
 
 ```java
-eventLogger.rememberMeRestored();
+finally {
+    mdc.clearFilterContext();
+    mdc.clearBusinessContext();
+}
 ```
 
-Before returning authenticate:
+This cleanup is required because servlet threads are reused.
+
+Do not remove it.
+
+---
+
+# 2. Simplify `SsoEntryController`
+
+Keep only the early context needed before `requestId` exists.
+
+Recommended:
 
 ```java
-SsoLogContext.setFlow(Flow.AUTHENTICATE.name());
-eventLogger.bootstrapResolved(Flow.AUTHENTICATE);
-return Flow.AUTHENTICATE;
+@GetMapping("/login/ssoAuthenticate")
+public ResponseEntity<Void> start(
+        @RequestParam String clientId,
+        @RequestParam String redirectUri,
+        @RequestParam String realm,
+        @RequestParam(required = false) String state,
+        @RequestParam(required = false) String scope,
+        @RequestParam(required = false, defaultValue = "code")
+        String responseType,
+        HttpServletRequest req) {
+
+    /*
+     * requestId does not exist yet.
+     * Set realm/clientId so validation failures still carry context.
+     */
+    mdc.applyJourneyContext(
+            null,
+            realm,
+            clientId
+    );
+
+    SsoRequest r = service.start(
+            req,
+            clientId,
+            redirectUri,
+            realm,
+            state,
+            scope,
+            responseType
+    );
+
+    log.info("SSO session request created");
+
+    return ResponseEntity
+            .status(HttpStatus.FOUND)
+            .location(
+                    URI.create(
+                            "http://localhost:5173/login/flow/"
+                                    + r.requestId()
+                    )
+            )
+            .build();
+}
 ```
 
-Do not log entire `ExternalUser`, `RequestUserContext`, or `RealmUserContext` objects.
-
-## 11. Modify authenticate(...)
-
-Current method accepts approximately:
+Remove this line from the controller if `AuthenticationService.start(...)` already populated the full request context:
 
 ```java
-public Flow authenticate(
+mdc.applyRequestContext(r);
+```
+
+Do not populate the same request context in both controller and service.
+
+---
+
+# 3. Simplify `AuthenticationService.start(...)`
+
+After generating the actual `requestId`, update MDC once.
+
+Recommended:
+
+```java
+public SsoRequest start(
         HttpServletRequest req,
-        HttpServletResponse response,
-        String requestId,
-        String username,
-        String password,
-        boolean rememberRequested)
+        String client,
+        String redirect,
+        String realm,
+        String state,
+        String scope,
+        String responseType) {
+
+    HttpSession existingSession =
+            req.getSession(false);
+
+    realm = policy.normalize(realm);
+
+    log.info(
+            "Starting SSO request: realm={}, clientId={}",
+            realm,
+            client
+    );
+
+    policy.validateClient(
+            realm,
+            client,
+            redirect
+    );
+
+    HttpSession session =
+            req.getSession(true);
+
+    if (existingSession == null) {
+        eventLogger.sessionCreated();
+    } else {
+        eventLogger.sessionReused();
+    }
+
+    repo.cleanupExpired(session);
+
+    String requestId =
+            UUID.randomUUID().toString();
+
+    /*
+     * This is the single authoritative point where
+     * the real SSO requestId is added to MDC.
+     */
+    mdc.applyJourneyContext(
+            requestId,
+            realm,
+            client
+    );
+
+    Instant now = Instant.now();
+
+    SsoRequest r =
+            new SsoRequest(
+                    requestId,
+                    client,
+                    realm,
+                    redirect,
+                    state,
+                    scope,
+                    responseType == null
+                            ? "code"
+                            : responseType,
+                    now,
+                    ...
+            );
+
+    repo.saveRequest(
+            session,
+            r
+    );
+
+    eventLogger.requestCreated();
+
+    return r;
+}
 ```
 
-Requirements:
-
-- Resolve stored `SsoRequest` from `requestId` first.
-- Set MDC request context using stored realm/client, not values resent by React.
-- Set `flow=AUTHENTICATE`.
-- Set privacy-safe `userKey`.
-- Log `FLOW_STARTED`.
-- Measure duration with `System.nanoTime()`.
-- Log `FLOW_COMPLETED` on success.
-- Log `FLOW_FAILED` with existing safe error code on known failure.
-- Never log password.
-- Preserve existing exception behavior.
-
-Example pattern:
+Remove the duplicate call if it writes the same MDC fields:
 
 ```java
-long started = System.nanoTime();
-
 SsoLogContext.setRequest(
         requestId,
-        ssoRequest.realm(),
-        ssoRequest.clientId()
+        realm,
+        client,
+        mdc
 );
-SsoLogContext.setFlow(Flow.AUTHENTICATE.name());
-SsoLogContext.setUserKey(
-        userKeyGenerator.generate(username)
-);
-
-eventLogger.flowStarted(Flow.AUTHENTICATE);
-
-try {
-    // existing authentication logic
-
-    long durationMs =
-            TimeUnit.NANOSECONDS.toMillis(
-                    System.nanoTime() - started
-            );
-
-    eventLogger.flowCompleted(
-            Flow.AUTHENTICATE,
-            durationMs
-    );
-
-    return next;
-
-} catch (InvalidCredentialsException ex) {
-
-    long durationMs =
-            TimeUnit.NANOSECONDS.toMillis(
-                    System.nanoTime() - started
-            );
-
-    eventLogger.flowFailed(
-            Flow.AUTHENTICATE,
-            "INVALID_CREDENTIALS",
-            durationMs
-    );
-
-    throw ex;
-}
 ```
 
-Use the project's real exception class and error code names.
+There should be one API for setting request-level business MDC fields.
 
-## 12. FlowNavigationController
-
-Existing endpoint:
+Preferred API:
 
 ```java
-@PostMapping("/select")
-public ActionResponse select(
-        @RequestParam String requestId,
-        @RequestParam Flow flow,
-        HttpServletRequest request) {
-
-    sso.beginJourney(
-            request.getSession(false),
-            requestId,
-            flow
-    );
-
-    return ActionResponse.next(
-            requestId,
-            flow.name()
-    );
-}
-```
-
-Do not count a UI click twice.
-
-Define dashboard semantics as:
-
-```text
-FLOW_STARTED = backend accepted and started a business flow
-```
-
-Prefer logging `FLOW_STARTED` in the service where `beginJourney(...)` or the actual recovery/business flow is accepted, not merely when React renders a component.
-
-## 13. Forgot Password
-
-Instrument backend methods/endpoints for:
-
-```text
-/forgot-password/start
-/forgot-password/verify
-/forgot-password/complete
-```
-
-Use the same `requestId` and set:
-
-```text
-flow=FORGOT_PASSWORD
-```
-
-Log lifecycle:
-
-```text
-FLOW_STARTED
-FLOW_COMPLETED
-FLOW_FAILED
-```
-
-Do not log email, phone number, OTP, password, token, or recovery secret.
-
-If useful, log only approved non-sensitive dimension:
-
-```text
-deliveryChannel=EMAIL
-deliveryChannel=SMS
-```
-
-## 14. Forgot Username
-
-Use:
-
-```text
-flow=FORGOT_USERNAME
-```
-
-Log:
-
-```text
-FLOW_STARTED
-FLOW_COMPLETED
-FLOW_FAILED
-```
-
-Do not log full email, phone, DOB, account number, SSN, or recovery answers.
-
-Preserve account-enumeration protections. Do not change user-facing behavior just for logging.
-
-## 15. Password Expired
-
-Use:
-
-```text
-flow=PASSWORD_EXPIRED
-```
-
-Log lifecycle only.
-
-Never log old/new/confirm password or actual password input.
-
-## 16. Missing Profile
-
-Use:
-
-```text
-flow=MISSING_PROFILE
-```
-
-Log lifecycle only.
-
-Do not log profile PII values. If analytics require missing field categories, log only approved field names/types such as `EMAIL` or `PHONE`, never the value.
-
-## 17. Transmit
-
-Use:
-
-```text
-flow=TRANSMIT
-```
-
-Log:
-
-```text
-FLOW_STARTED
-FLOW_COMPLETED
-FLOW_FAILED
-```
-
-Also instrument external Transmit SDK/service calls using:
-
-```text
-EXTERNAL_CALL_STARTED
-EXTERNAL_CALL_COMPLETED
-EXTERNAL_CALL_FAILED
-```
-
-Fields:
-
-```text
-externalService=transmit
-operation=<stable safe operation>
-durationMs
-errorCode
-```
-
-Never log Transmit tokens, session secrets, challenge secrets, or credential material.
-
-## 18. RemoteExternalLoginClient
-
-Instrument each network call to the external login service.
-
-Examples:
-
-```text
-externalService=login-service
-operation=authenticate
-operation=forgotPasswordStart
-operation=forgotPasswordVerify
-operation=forgotPasswordComplete
-operation=forgotUsernameStart
-operation=forgotUsernameVerify
-```
-
-Pattern:
-
-```java
-long started = System.nanoTime();
-
-eventLogger.externalCallStarted(
-        "login-service",
-        "authenticate"
-);
-
-try {
-    ExternalUser result = ...existing call...;
-
-    long durationMs =
-            TimeUnit.NANOSECONDS.toMillis(
-                    System.nanoTime() - started
-            );
-
-    eventLogger.externalCallCompleted(
-            "login-service",
-            "authenticate",
-            durationMs
-    );
-
-    return result;
-
-} catch (KnownExternalException ex) {
-
-    long durationMs =
-            TimeUnit.NANOSECONDS.toMillis(
-                    System.nanoTime() - started
-            );
-
-    eventLogger.externalCallFailed(
-            "login-service",
-            "authenticate",
-            existingSafeErrorCode,
-            durationMs
-    );
-
-    throw ex;
-}
-```
-
-Do not log raw external request/response bodies.
-
-## 19. GlobalExceptionHandler
-
-Update existing handler carefully to avoid duplicate logs.
-
-Recommended ownership:
-
-- Flow/service layer logs expected lifecycle failures when it owns the flow.
-- Global exception handler logs unexpected/system errors once.
-
-Unexpected errors:
-
-```java
-eventLogger.systemError(
-        "INTERNAL_ERROR",
-        ex
+mdc.applyJourneyContext(
+        requestId,
+        realm,
+        clientId
 );
 ```
 
-Stack trace should be present for unexpected exceptions.
+---
 
-When MDC is available, Splunk should also contain:
+# 4. Decide whether `SsoLogContext` is still needed
+
+Inspect:
 
 ```text
-requestId
+SsoLogContext.java
+MdcContextService.java
+```
+
+If both are doing the same thing, remove one abstraction.
+
+Preferred direction:
+
+```text
+MdcContextService
+```
+
+should own all MDC writes.
+
+For example:
+
+```java
+mdc.applyJourneyContext(
+        requestId,
+        realm,
+        clientId
+);
+
+mdc.setFlow(flow);
+
+mdc.setUserKey(userKey);
+
+mdc.setExternalService(service);
+```
+
+If `SsoLogContext` contains unique useful logic, keep it.
+
+If it only forwards calls to `MdcContextService`, remove it.
+
+Do not maintain two competing MDC APIs.
+
+---
+
+# 5. Required MDC ownership
+
+Use these fields consistently:
+
+```text
 trackingId
+requestId
 realm
 clientId
 flow
+userKey
+externalService
+httpMethod
+requestPath
 ```
 
-## 20. Final SSO completion/failure
-
-Find the code that creates the final authorization result / redirect to the relying party.
-
-Log exactly one terminal journey event.
-
-Success:
+Ownership:
 
 ```text
-eventCode=SSO_REQUEST_COMPLETED
-result=SUCCESS
+RequestTrackingFilter:
+    trackingId
+    httpMethod
+    requestPath
+
+SSO entry/service:
+    requestId
+    realm
+    clientId
+
+Flow services:
+    flow
+
+Authentication flow:
+    userKey
+
+External client/adapter:
+    externalService
 ```
 
-Failure:
+---
+
+# 6. `trackingId` and `requestId` are different concepts
+
+Do not intentionally set:
 
 ```text
-eventCode=SSO_REQUEST_FAILED
-result=FAILED
-errorCode=<safe code>
+trackingId = requestId
 ```
 
-Calculate end-to-end duration from the existing `SsoRequest` creation timestamp:
+They represent different correlation levels.
+
+## `trackingId`
+
+One HTTP request.
+
+Example:
+
+```text
+GET /bootstrap
+trackingId=HTTP-001
+```
+
+## `requestId`
+
+One complete SSO journey.
+
+Example:
+
+```text
+requestId=SSO-ABC
+```
+
+Expected journey:
+
+```text
+/login/ssoAuthenticate
+trackingId=HTTP-001
+requestId=SSO-ABC
+
+/api/auth/bootstrap/SSO-ABC
+trackingId=HTTP-002
+requestId=SSO-ABC
+
+/api/auth/authenticate
+trackingId=HTTP-003
+requestId=SSO-ABC
+
+/api/auth/flow/select
+trackingId=HTTP-004
+requestId=SSO-ABC
+```
+
+The requestId stays the same across the full journey.
+
+The trackingId changes per HTTP request.
+
+---
+
+# 7. Check frontend behavior
+
+Inspect the React API client.
+
+If React currently sends:
+
+```text
+X-Tracking-Id = requestId
+```
+
+remove that behavior.
+
+Preferred:
+
+- frontend sends `requestId` only as the business request identifier
+- backend filter generates `trackingId` per HTTP request if upstream did not provide one
+
+Frontend should not intentionally make the two identifiers identical.
+
+---
+
+# 8. Early validation errors
+
+The reason `SsoEntryController` may temporarily call:
 
 ```java
-long durationMs = Duration.between(
-        request.createdAt(),
-        Instant.now()
-).toMillis();
+mdc.applyJourneyContext(
+        null,
+        realm,
+        clientId
+);
 ```
 
-This must be exactly one terminal event per SSO request so Splunk request counts remain accurate.
+is to support failures before requestId generation.
 
-## 21. Session/context reuse events
+Example:
 
-At SSO entry:
+```text
+CLIENT_NOT_ALLOWED
+REDIRECT_URI_NOT_ALLOWED
+REALM_DISABLED
+```
+
+These logs should still contain:
+
+```text
+trackingId
+realm
+clientId
+```
+
+but may have:
+
+```text
+requestId=""
+```
+
+That is acceptable because the SSO request was rejected before requestId creation.
+
+---
+
+# 9. Normal successful entry flow
+
+Expected logging progression:
+
+```text
+RequestTrackingFilter
+    trackingId=HTTP-001
+
+SsoEntryController
+    trackingId=HTTP-001
+    realm=BCA
+    clientId=bca-web
+    requestId=
+
+AuthenticationService.start
+    generates requestId=SSO-ABC
+
+AuthenticationService.start
+    trackingId=HTTP-001
+    requestId=SSO-ABC
+    realm=BCA
+    clientId=bca-web
+
+SSO_REQUEST_CREATED
+    trackingId=HTTP-001
+    requestId=SSO-ABC
+```
+
+After response completes, filter clears MDC.
+
+---
+
+# 10. Later API request flow
+
+For:
+
+```text
+GET /api/auth/bootstrap/SSO-ABC
+```
+
+filter creates:
+
+```text
+trackingId=HTTP-002
+```
+
+The service/controller resolves stored `SsoRequest` using:
+
+```text
+requestId=SSO-ABC
+```
+
+Then MDC becomes:
+
+```text
+trackingId=HTTP-002
+requestId=SSO-ABC
+realm=BCA
+clientId=bca-web
+```
+
+That is the desired Splunk correlation model.
+
+---
+
+# 11. Do not log session IDs
+
+Keep session events:
 
 ```text
 SESSION_CREATED
 SESSION_REUSED
 ```
 
-In bootstrap:
+But never include:
 
 ```text
-REALM_CONTEXT_REUSED
-CROSS_REALM_CONTEXT_REUSED
-REMEMBER_ME_RESTORED
+session.getId()
+SSOSESSION cookie
 ```
 
-This should allow dashboard questions such as:
+in logs.
+
+---
+
+# 12. Preserve current business behavior
+
+This cleanup must not change:
 
 ```text
-How many SSO requests reused an existing browser session?
-How many users skipped credentials because same-realm context existed?
-How many used cross-realm reuse?
-How many were restored by Remember Me?
+session reuse
+requestId generation
+GemFire session handling
+bootstrap behavior
+same-realm reuse
+cross-realm reuse
+remember-me
+CSRF
+CORS
+security
+redirect validation
+realm/client validation
+React API contract
+external login-service contract
 ```
 
-## 22. Standard field names
+Only logging/MDC ownership should change.
 
-Use these exact names consistently when known:
+---
+
+# 13. Tests to add/update
+
+## MDC ownership test
+
+Verify that after `AuthenticationService.start(...)`:
+
+```text
+requestId
+realm
+clientId
+```
+
+are populated once and correctly.
+
+## Entry validation failure test
+
+For an invalid client:
+
+```text
+trackingId is present
+realm is present
+clientId is present
+requestId may be empty
+```
+
+## Tracking/request separation test
+
+Verify:
+
+```text
+trackingId != requestId
+```
+
+unless an upstream system coincidentally supplied the same value.
+
+Do not enforce inequality as a hard production validation rule; just ensure the application does not intentionally assign one from the other.
+
+## Filter cleanup test
+
+After request completion:
+
+```text
+trackingId cleared
+httpMethod cleared
+requestPath cleared
+requestId cleared
+realm cleared
+clientId cleared
+flow cleared
+userKey cleared
+externalService cleared
+```
+
+## Existing behavior regression tests
+
+Ensure all existing authentication/session tests still pass.
+
+---
+
+# 14. Copilot implementation instructions
+
+Use this exact implementation sequence:
+
+1. Inspect `MdcContextService.java`.
+2. Inspect `SsoLogContext.java`.
+3. Identify duplicate MDC responsibilities.
+4. Keep `RequestTrackingFilter` as owner of HTTP correlation fields.
+5. Keep early realm/client context in `SsoEntryController`.
+6. Remove `mdc.applyRequestContext(r)` from controller if redundant.
+7. Make `AuthenticationService.start(...)` the single authoritative place where the real requestId is applied.
+8. Remove `SsoLogContext.setRequest(...)` if redundant.
+9. Check React API client for incorrect `X-Tracking-Id=requestId` behavior.
+10. Update tests.
+11. Run the full existing test suite.
+12. Do not modify functional SSO behavior.
+
+---
+
+# 15. Definition of done
+
+The task is complete when:
+
+1. One SSO request creates one `requestId`.
+2. One HTTP call has one `trackingId`.
+3. `trackingId` and `requestId` are not intentionally derived from each other.
+4. Early SSO validation logs have realm/client/tracking context.
+5. Once requestId is generated, all downstream logs for that HTTP request contain it.
+6. Subsequent HTTP calls resolve and repopulate the same SSO requestId.
+7. MDC fields are populated through one clear service/API.
+8. Duplicate MDC writes are removed.
+9. MDC is fully cleared when the servlet request completes.
+10. No session ID, credentials, tokens, OTPs, or sensitive payloads are logged.
+11. Existing SSO behavior and tests remain unchanged.
+
+---
+
+# 16. Track `previousRequestId` for repeated `/ssoAuthenticate` calls
+
+Add support for linking a newly created SSO request to the most recent previous SSO request in the same browser `HttpSession`.
+
+This is for **observability only**.
+
+Do not use `previousRequestId` for:
+
+```text
+authorization
+flow selection
+realm selection
+redirect decisions
+user-context lookup
+security decisions
+```
+
+The real business/security key remains:
+
+```text
+requestId
+```
+
+## Desired behavior
+
+If the same browser calls:
+
+```text
+/login/ssoAuthenticate
+```
+
+for the first time:
+
+```text
+trackingId=HTTP-001
+requestId=REQ-1001
+previousRequestId=
+sessionReused=false
+```
+
+If the same browser later calls `/login/ssoAuthenticate` again while the same `HttpSession` is valid:
+
+```text
+trackingId=HTTP-010
+requestId=REQ-2002
+previousRequestId=REQ-1001
+sessionReused=true
+```
+
+Always create a **new** `requestId`.
+
+Never reuse the previous `requestId` for the new SSO authorization request.
+
+---
+
+# 17. Read previous request before generating the new request
+
+Inside `AuthenticationService.start(...)`, before generating the new UUID, determine the most recent existing SSO request in the current session.
+
+Preferred approach:
+
+```java
+HttpSession existingSession =
+        req.getSession(false);
+
+String previousRequestId = null;
+
+if (existingSession != null) {
+    previousRequestId =
+            repo.latestRequest(existingSession)
+                    .map(SsoRequest::requestId)
+                    .orElse(null);
+}
+```
+
+Then continue with the normal logic:
+
+```java
+HttpSession session =
+        req.getSession(true);
+
+String requestId =
+        UUID.randomUUID().toString();
+```
+
+Do not overwrite the previous request.
+
+The session may contain multiple requests:
+
+```text
+SSOSESSION
+├── REQ-1001
+├── REQ-1500
+└── REQ-2002
+```
+
+`previousRequestId` is only a telemetry relationship between the new request and the most recent prior request.
+
+---
+
+# 18. Add repository helper for latest request if needed
+
+If `SessionStateRepository` does not already support this, add a helper such as:
+
+```java
+public Optional<SsoRequest> latestRequest(
+        HttpSession session) {
+
+    return requests(session)
+            .values()
+            .stream()
+            .max(
+                    Comparator.comparing(
+                            SsoRequest::createdAt
+                    )
+            );
+}
+```
+
+Adapt this to the actual repository structure.
+
+Do not introduce a separate authoritative:
+
+```text
+CURRENT_REQUEST_ID
+```
+
+or:
+
+```text
+LAST_REQUEST_ID
+```
+
+for business logic.
+
+If a `LAST_REQUEST_ID` helper attribute is used for telemetry, it must never drive authentication, authorization, or flow decisions.
+
+Using the timestamp from the existing request map is preferred.
+
+---
+
+# 19. Add `previousRequestId` to MDC
+
+Extend `MdcContextService` with a method similar to:
+
+```java
+public void setPreviousRequestId(
+        String previousRequestId) {
+
+    if (previousRequestId == null
+            || previousRequestId.isBlank()) {
+        MDC.remove("previousRequestId");
+        return;
+    }
+
+    MDC.put(
+            "previousRequestId",
+            previousRequestId
+    );
+}
+```
+
+After generating the new request ID:
+
+```java
+String requestId =
+        UUID.randomUUID().toString();
+
+mdc.applyJourneyContext(
+        requestId,
+        realm,
+        client
+);
+
+mdc.setPreviousRequestId(
+        previousRequestId
+);
+```
+
+The MDC for that `/ssoAuthenticate` call should then contain:
+
+```text
+trackingId=HTTP-010
+requestId=REQ-2002
+previousRequestId=REQ-1001
+realm=BCA
+clientId=bca-web
+```
+
+---
+
+# 20. Do NOT clear `previousRequestId` immediately
+
+Do not do this:
+
+```java
+mdc.setPreviousRequestId(
+        previousRequestId
+);
+
+String requestId =
+        UUID.randomUUID().toString();
+
+mdc.setPreviousRequestId(null);
+```
+
+That removes the relationship too early and later logs in the same HTTP request will no longer contain it.
+
+Keep `previousRequestId` in MDC for the full lifetime of that HTTP request.
+
+The servlet filter should clear it at the end.
+
+---
+
+# 21. Clear `previousRequestId` with business MDC
+
+Update:
+
+```java
+MdcContextService.clearBusinessContext()
+```
+
+to include:
+
+```java
+MDC.remove("previousRequestId");
+```
+
+Example:
+
+```java
+public void clearBusinessContext() {
+
+    MDC.remove("requestId");
+    MDC.remove("previousRequestId");
+    MDC.remove("realm");
+    MDC.remove("clientId");
+    MDC.remove("flow");
+    MDC.remove("userKey");
+    MDC.remove("externalService");
+}
+```
+
+The existing filter cleanup should remain:
+
+```java
+finally {
+    mdc.clearFilterContext();
+    mdc.clearBusinessContext();
+}
+```
+
+This prevents one servlet-thread request from leaking correlation values into the next request.
+
+---
+
+# 22. Add `previousRequestId` to `SSO_REQUEST_CREATED`
+
+When the new request is saved:
+
+```java
+repo.saveRequest(
+        session,
+        r
+);
+```
+
+emit an event that includes the relationship.
+
+If `previousRequestId` is already in MDC, the event logger only needs to log:
+
+```java
+eventLogger.requestCreated(
+        existingSession != null
+);
+```
+
+or equivalent.
+
+Expected structured fields:
+
+```text
+eventCode=SSO_REQUEST_CREATED
+trackingId=HTTP-010
+requestId=REQ-2002
+previousRequestId=REQ-1001
+realm=BCA
+clientId=bca-web
+sessionReused=true
+result=SUCCESS
+```
+
+Do not log the actual session ID.
+
+---
+
+# 23. First request behavior
+
+For the first request in a browser session:
+
+```text
+previousRequestId
+```
+
+will be absent.
+
+Expected:
+
+```text
+eventCode=SSO_REQUEST_CREATED
+trackingId=HTTP-001
+requestId=REQ-1001
+previousRequestId=
+realm=BCA
+clientId=bca-web
+sessionReused=false
+```
+
+This is valid.
+
+Do not create fake values such as:
+
+```text
+previousRequestId=NONE
+previousRequestId=NEW
+previousRequestId=NA
+```
+
+Prefer null/absent structured field.
+
+---
+
+# 24. Subsequent request behavior
+
+For a second `/ssoAuthenticate` in the same browser session:
+
+```text
+eventCode=SSO_REQUEST_CREATED
+trackingId=HTTP-010
+requestId=REQ-2002
+previousRequestId=REQ-1001
+realm=BCA
+clientId=bca-web
+sessionReused=true
+```
+
+Then `bootstrap(...)` may produce:
+
+```text
+eventCode=REALM_CONTEXT_REUSED
+requestId=REQ-2002
+realm=BCA
+```
+
+This lets Splunk show:
+
+```text
+REQ-1001
+    authenticated BCA user
+
+REQ-2002
+    linked to REQ-1001
+    same browser session reused
+    BCA realm context reused
+    credentials not requested again
+```
+
+---
+
+# 25. Do not store `previousTrackingId`
+
+Do not add:
+
+```text
+previousTrackingId
+```
+
+to the session.
+
+`trackingId` represents a single HTTP request and is already searchable in Splunk.
+
+The desired model is:
+
+```text
+First SSO entry:
+trackingId=HTTP-A
+requestId=REQ-1
+
+Second SSO entry:
+trackingId=HTTP-B
+requestId=REQ-2
+previousRequestId=REQ-1
+```
+
+This is sufficient to trace the relationship.
+
+---
+
+# 26. Multi-tab safety
+
+The browser session can have multiple independent SSO authorization requests.
+
+Example:
+
+```text
+SSOSESSION
+├── REQ-1001  BCA/client-A
+├── REQ-1002  CCA/client-B
+├── REQ-1003  BCA/client-C
+└── REQ-1004  RCA/client-D
+```
+
+Do not treat `previousRequestId` as the active request.
+
+Every API request must continue to identify its own `requestId`.
+
+`previousRequestId` is only useful for Splunk troubleshooting.
+
+Do not use:
+
+```java
+previousRequestId
+```
+
+to resolve:
+
+```text
+realm
+clientId
+journey
+request user
+authorization request
+redirect URI
+```
+
+---
+
+# 27. Splunk queries for repeated SSO requests
+
+## Show a request and its previous request
+
+```spl
+index=sso_prod
+requestId="REQ-2002"
+| table
+    _time
+    trackingId
+    requestId
+    previousRequestId
+    realm
+    clientId
+    eventCode
+    flow
+    result
+    errorCode
+```
+
+## Show both journeys
+
+After identifying:
+
+```text
+requestId=REQ-2002
+previousRequestId=REQ-1001
+```
+
+search:
+
+```spl
+index=sso_prod
+requestId IN ("REQ-1001","REQ-2002")
+| sort _time
+| table
+    _time
+    requestId
+    trackingId
+    eventCode
+    realm
+    clientId
+    flow
+    result
+    errorCode
+```
+
+This should show whether the second request:
+
+```text
+reused the same browser session
+reused same-realm context
+used cross-realm context
+went through remember-me
+required authentication again
+failed during bootstrap
+failed during a downstream flow
+```
+
+---
+
+# 28. Tests for `previousRequestId`
+
+Add tests covering:
+
+## First SSO request
+
+Expected:
+
+```text
+new requestId generated
+previousRequestId absent
+sessionCreated event emitted
+```
+
+## Second request in same session
+
+Expected:
+
+```text
+new requestId generated
+new requestId != previous requestId
+previousRequestId points to earlier request
+sessionReused event emitted
+```
+
+## Three requests
+
+Example:
+
+```text
+REQ-1
+REQ-2 previousRequestId=REQ-1
+REQ-3 previousRequestId=REQ-2
+```
+
+## MDC cleanup
+
+After HTTP request completion:
+
+```text
+requestId cleared
+previousRequestId cleared
+realm cleared
+clientId cleared
+trackingId cleared by filter context cleanup
+```
+
+## Multi-tab safety
+
+Verify that adding `previousRequestId` does not change lookup behavior for independently active `requestId` values.
+
+---
+
+# 29. Updated MDC field list
+
+When known, structured logging should support:
 
 ```text
 trackingId
 requestId
+previousRequestId
 realm
 clientId
 flow
@@ -869,277 +1361,461 @@ operation
 nextAction
 sourceRealm
 targetRealm
+sessionReused
 ```
 
-Do not use variants like `reqId`, `requestID`, `request-id`, `authRequestId` for the same concept.
+---
 
-## 23. Dashboard event semantics
+# 30. Updated definition of done
 
-Use these definitions exactly:
+In addition to the previous definition of done:
 
-- Incoming SSO requests: `eventCode=SSO_REQUEST_CREATED`
-- Started business flows: `eventCode=FLOW_STARTED`
-- Successful flows: `eventCode=FLOW_COMPLETED`
-- Failed flows: `eventCode=FLOW_FAILED`
-- Successful complete SSO journeys: `eventCode=SSO_REQUEST_COMPLETED`
-- Failed complete SSO journeys: `eventCode=SSO_REQUEST_FAILED`
-- Dependency success/failure: `EXTERNAL_CALL_COMPLETED` / `EXTERNAL_CALL_FAILED`
+1. Repeated `/ssoAuthenticate` calls create a new `requestId`.
+2. The new request can expose the most recent prior request as `previousRequestId`.
+3. `previousRequestId` is available to logs for the entire `/ssoAuthenticate` HTTP request.
+4. It is cleared automatically at request completion.
+5. It is not used for security/business decisions.
+6. No previous tracking ID or session ID is persisted for correlation.
+7. Splunk can easily show the old and new SSO journeys together.
 
-Do not count arbitrary log lines for dashboard totals.
+---
 
-## 24. Expected single-request journey
+# 31. Ready-to-paste GitHub Copilot prompt
 
-A search for one `requestId` should produce a chronological sequence similar to:
+Copy and paste the following prompt into GitHub Copilot Chat from the root of the `sso-backend` repository.
 
 ```text
-SSO_REQUEST_CREATED
+Read the complete file:
+
+SSO_MDC_Correlation_Cleanup_Copilot_Guide.md
+
+before making any code changes.
+
+I want you to implement the MDC, request correlation, previousRequestId, and Splunk observability changes described in that document against my CURRENT existing source code.
+
+IMPORTANT: Do not blindly generate replacement classes from the examples in the markdown file. First inspect the actual existing implementation and adapt the changes to the existing architecture, class names, models, repositories, exception types, methods, and coding conventions.
+
+First inspect these files/classes and any directly related dependencies:
+
+1. RequestTrackingFilter
+2. MdcContextService
+3. SsoLogContext
+4. SsoEventLogger
+5. SsoEventCode
+6. SsoEntryController
+7. AuthenticationService
+8. SessionStateRepository or the actual session repository implementation
+9. SsoRequest model
+10. BootstrapController
+11. AuthenticationController
+12. FlowNavigationController
+13. RecoveryController
+14. PostAuthenticationController
+15. GlobalExceptionHandler
+16. ExternalLoginClient / RemoteExternalLoginClient
+17. Remember Me implementation
+18. Transmit service/adapter
+19. React SsoApiClient only if needed to verify trackingId behavior
+
+Before coding, give me a short implementation plan containing:
+
+- files that will be modified
+- files that will be created, if any
+- duplicate MDC logic you found
+- how trackingId currently works
+- how requestId currently works
+- where previousRequestId will be obtained
+- how previousRequestId will be cleared
+- any risks you found
+
+Then implement the changes incrementally.
+
+CORRELATION RULES
+
+1. trackingId represents ONE HTTP request.
+2. requestId represents ONE complete SSO authorization journey.
+3. previousRequestId represents the immediately previous SSO request found in the same valid browser HttpSession and is OBSERVABILITY ONLY.
+4. Never intentionally set trackingId equal to requestId.
+5. Never reuse an old requestId for a new /ssoAuthenticate call.
+6. Every /ssoAuthenticate call must continue generating a new requestId.
+7. Subsequent APIs for the same journey must continue using the same requestId.
+8. previousRequestId must never be used for authentication, authorization, realm resolution, flow selection, redirect decisions, or session lookup.
+9. Do not persist previousTrackingId.
+10. Do not log the actual HttpSession ID or SSOSESSION cookie.
+
+EXPECTED REPEATED REQUEST BEHAVIOR
+
+First browser call:
+
+trackingId=HTTP-001
+requestId=REQ-1001
+previousRequestId=<absent>
+realm=BCA
+clientId=bca-web
+sessionReused=false
+
+Second /ssoAuthenticate call in the same valid browser session:
+
+trackingId=HTTP-010
+requestId=REQ-2002
+previousRequestId=REQ-1001
+realm=BCA
+clientId=bca-web
+sessionReused=true
+
+Third call:
+
+trackingId=HTTP-020
+requestId=REQ-3003
+previousRequestId=REQ-2002
+sessionReused=true
+
+The SSO request map must continue supporting multiple concurrent requestIds for multi-tab safety.
+
+MDC OWNERSHIP
+
+RequestTrackingFilter owns:
+
+- trackingId
+- httpMethod
+- requestPath
+
+SSO entry/service owns:
+
+- requestId
+- previousRequestId
+- realm
+- clientId
+
+Flow/business services own:
+
+- flow
+- userKey
+- externalService
+
+Do not maintain duplicate competing MDC APIs.
+
+Inspect MdcContextService and SsoLogContext. If both perform the same operation, consolidate them using the least disruptive approach. Prefer the existing MdcContextService if it is already the established abstraction.
+
+SSO ENTRY CONTROLLER
+
+The controller may temporarily populate:
+
+requestId=null
+realm=<incoming realm>
+clientId=<incoming client>
+
+so CLIENT_NOT_ALLOWED, REALM_DISABLED, REDIRECT_URI_NOT_ALLOWED, and similar errors occurring before requestId creation still have trackingId/realm/clientId.
+
+Once AuthenticationService.start() generates the real requestId, that service should become the authoritative place that updates the full journey MDC.
+
+Remove redundant controller calls such as applyRequestContext(r) if start() already populated exactly the same MDC context.
+
+AUTHENTICATIONSERVICE.START
+
+Preserve all existing functional behavior.
+
+Before creating a new request:
+
+- detect whether an existing HttpSession exists
+- determine the latest previously stored SsoRequest, if one exists
+- capture its requestId as previousRequestId
+
+Then:
+
+- reuse/create HttpSession exactly as today
+- normalize and validate realm/client/redirect exactly as today
+- generate a NEW UUID requestId
+- populate requestId/previousRequestId/realm/clientId into MDC
+- create and save the new SsoRequest
+- emit SESSION_CREATED or SESSION_REUSED
+- emit SSO_REQUEST_CREATED
+
+Do not overwrite/delete the previous SsoRequest merely to support telemetry.
+
+Prefer determining the latest request from existing request creation timestamps.
+
+If repository support is missing, add a safe helper such as latestRequest(HttpSession), adapting it to the actual storage implementation.
+
+PREVIOUSREQUESTID LIFECYCLE
+
+Keep previousRequestId in MDC for the remainder of the current /ssoAuthenticate HTTP request so every log produced after new request creation can contain:
+
+trackingId
+requestId
+previousRequestId
+realm
+clientId
+
+Do NOT immediately set previousRequestId to null after generating the new requestId.
+
+At servlet-request completion, RequestTrackingFilter cleanup must clear it through clearBusinessContext().
+
+Ensure:
+
+MDC.remove("previousRequestId")
+
+is included in business-context cleanup.
+
+MULTI-TAB SAFETY
+
+Do not introduce a global CURRENT_REQUEST_ID or use LAST_REQUEST_ID for authentication logic.
+
+Example valid session:
+
+REQ-1001 -> BCA/client-A
+REQ-1002 -> CCA/client-B
+REQ-1003 -> BCA/client-C
+
+Each browser tab/API must continue supplying its own requestId.
+
+previousRequestId is telemetry only.
+
+SESSION / REALM REUSE
+
+Preserve existing bootstrap behavior:
+
+- active journey by requestId
+- request-specific user context
+- valid same-realm user context
+- allowed cross-realm reuse
+- Remember Me restoration
+- AUTHENTICATE fallback
+- request-user binding
+- nextFor(user)
+
+Add/retain appropriate stable observability events:
+
+SESSION_CREATED
+SESSION_REUSED
+REALM_CONTEXT_REUSED
+CROSS_REALM_CONTEXT_REUSED
+REMEMBER_ME_RESTORED
 BOOTSTRAP_STARTED
-BOOTSTRAP_RESOLVED flow=AUTHENTICATE
-FLOW_STARTED flow=AUTHENTICATE
-EXTERNAL_CALL_STARTED externalService=login-service operation=authenticate
-EXTERNAL_CALL_FAILED errorCode=INVALID_CREDENTIALS
-FLOW_FAILED flow=AUTHENTICATE errorCode=INVALID_CREDENTIALS
-FLOW_STARTED flow=FORGOT_PASSWORD
-EXTERNAL_CALL_STARTED operation=forgotPasswordStart
-EXTERNAL_CALL_COMPLETED operation=forgotPasswordStart
-FLOW_COMPLETED flow=FORGOT_PASSWORD
-FLOW_STARTED flow=TRANSMIT
-FLOW_COMPLETED flow=TRANSMIT
-SSO_REQUEST_COMPLETED result=SUCCESS durationMs=8421
-```
+BOOTSTRAP_RESOLVED
 
-All lines above must share the same `requestId`.
+FLOW LOGGING
 
-Each separate HTTP call should have its own `trackingId`.
+Ensure stable lifecycle logging supports:
 
-## 25. Splunk searches the code must support
-
-One complete journey:
-
-```spl
-index=sso_prod requestId="<request-id>"
-| sort _time
-| table _time trackingId eventCode realm clientId flow result errorCode durationMs operation message
-```
-
-BCA request count:
-
-```spl
-index=sso_prod eventCode="SSO_REQUEST_CREATED" realm="BCA"
-| stats count as totalRequests
-```
-
-Requests by realm:
-
-```spl
-index=sso_prod eventCode="SSO_REQUEST_CREATED"
-| stats count as totalRequests by realm
-```
-
-Flow distribution:
-
-```spl
-index=sso_prod eventCode="FLOW_STARTED"
-| chart count over realm by flow
-```
-
-Forgot Password:
-
-```spl
-index=sso_prod eventCode="FLOW_STARTED" flow="FORGOT_PASSWORD"
-| stats count by realm
-```
-
-Forgot Username:
-
-```spl
-index=sso_prod eventCode="FLOW_STARTED" flow="FORGOT_USERNAME"
-| stats count by realm
-```
-
-Transmit success/failure:
-
-```spl
-index=sso_prod flow="TRANSMIT"
-eventCode IN ("FLOW_COMPLETED","FLOW_FAILED")
-| chart count over realm by eventCode
-```
-
-Top errors:
-
-```spl
-index=sso_prod
-eventCode IN ("FLOW_FAILED","SSO_REQUEST_FAILED","EXTERNAL_CALL_FAILED")
-| stats count as failures by realm errorCode
-| sort - failures
-```
-
-Unique users, only using privacy-safe `userKey`:
-
-```spl
-index=sso_prod eventCode="FLOW_COMPLETED" flow="AUTHENTICATE"
-| stats dc(userKey) as uniqueUsers by realm
-```
-
-End-to-end SSO performance:
-
-```spl
-index=sso_prod eventCode="SSO_REQUEST_COMPLETED"
-| stats avg(durationMs) as avgMs perc95(durationMs) as p95Ms perc99(durationMs) as p99Ms by realm
-```
-
-## 26. Tests to add
-
-### RequestTrackingFilterTest
-
-Verify:
-
-- generates tracking ID when missing
-- reuses incoming `X-Tracking-Id`
-- writes response header
-- clears MDC after request
-
-### UserKeyGeneratorTest
-
-Verify:
-
-- same normalized username produces same key
-- case differences produce same key
-- null/blank returns null
-- raw username is not present in generated key
-
-### AuthenticationService tests
-
-Verify logging changes do not alter behavior:
-
-- new `/ssoAuthenticate` creates new requestId
-- existing valid HttpSession is reused
-- bootstrap with same-realm context skips `AUTHENTICATE`
-- active journey resumes
-- cross-realm reuse still works
-- Remember Me behavior remains unchanged
-
-### Flow behavior tests
-
-Cover:
-
-```text
 AUTHENTICATE
 FORGOT_PASSWORD
 FORGOT_USERNAME
 PASSWORD_EXPIRED
 MISSING_PROFILE
 TRANSMIT
-```
 
-### Security logging tests
+Use:
 
-Where practical, use a test appender and verify logs do not contain:
+FLOW_STARTED
+FLOW_COMPLETED
+FLOW_FAILED
 
-```text
-password values
-raw CSRF token
-SSOSESSION value
-remember-me token
-access token
-refresh token
-OTP
-security answers
-```
+Do not count React page rendering as FLOW_STARTED. FLOW_STARTED should mean the backend accepted/started that business flow.
 
-## 27. Do not change existing behavior
+EXTERNAL CALL LOGGING
 
-Logging work must not change:
+Instrument existing external login/identity and Transmit calls using:
 
-- session creation/reuse semantics
-- requestId generation semantics
-- GemFire-backed session behavior
-- realm timeout rules
-- same-realm reuse
-- cross-realm reuse
-- Remember Me behavior
-- external login-service contract
-- controller API contracts
-- React API contracts
-- CSRF behavior
-- CORS behavior
-- authorization behavior
-- redirect validation
-- client/realm policy validation
+EXTERNAL_CALL_STARTED
+EXTERNAL_CALL_COMPLETED
+EXTERNAL_CALL_FAILED
 
-## 28. Copilot implementation order
+Include safe fields:
 
-1. Inspect existing MDC, logging, tracking, and sanitizer code.
-2. Reuse existing equivalents where available.
-3. Add/extend `RequestTrackingFilter`.
-4. Add `SsoLogContext`.
-5. Add `SsoEventCode`.
-6. Add `SsoEventLogger`.
-7. Add privacy-safe `UserKeyGenerator`.
-8. Add/extend `LogSanitizer`.
-9. Instrument `AuthenticationService.start(...)`.
-10. Instrument `AuthenticationService.bootstrap(...)`.
-11. Instrument `AuthenticationService.authenticate(...)`.
-12. Instrument business flow start/navigation appropriately.
-13. Instrument Forgot Password.
-14. Instrument Forgot Username.
-15. Instrument Password Expired.
-16. Instrument Missing Profile.
-17. Instrument Transmit.
-18. Instrument `RemoteExternalLoginClient`.
-19. Update `GlobalExceptionHandler` without duplicate error logs.
-20. Add final SSO completion/failure logging.
-21. Add tests.
-22. Run all existing tests and ensure no functional behavior changes.
+externalService
+operation
+durationMs
+errorCode
+requestId
+trackingId
+realm
+clientId
+flow
 
-## 29. Copilot constraints
+Do not log request/response bodies containing sensitive information.
 
-- Follow existing package naming and style.
-- Use constructor injection.
-- Do not use `System.out.println`.
-- Use existing SLF4J/Logback only.
-- Avoid duplicate logs.
-- Never log credentials/tokens/session IDs.
-- Preserve existing exception mapping.
-- Preserve API response models.
-- Preserve the existing `Flow` enum unless absolutely necessary.
-- Prefer existing error codes.
-- Use `System.nanoTime()` for elapsed duration and emit milliseconds.
-- Never generate another business `requestId` after SSO entry.
-- Never trust realm/client resent by React; resolve them from stored `SsoRequest` by `requestId`.
-- Keep dashboard event semantics stable.
-- Add comments only where correlation/security intent is not obvious.
+ERROR LOGGING
 
-## 30. Definition of done
+Do not double-log expected exceptions.
 
-Implementation is complete when:
+Review GlobalExceptionHandler and service-level logging and establish one consistent ownership rule.
 
-1. Searching one `requestId` in Splunk shows the complete SSO journey in order.
-2. Every HTTP call has a `trackingId`.
-3. Every SSO journey has one stable `requestId`.
-4. Realm/client are available once resolved.
-5. Authentication success/failure is measurable.
-6. Forgot Password usage is measurable.
-7. Forgot Username usage is measurable.
-8. Password Expired usage is measurable.
-9. Missing Profile usage is measurable.
-10. Transmit usage/success/failure is measurable.
-11. External login-service success/failure/latency is measurable.
-12. Session reuse and realm-context reuse are measurable.
-13. End-to-end SSO latency is measurable.
-14. Unexpected errors include stack traces and correlation identifiers.
-15. No password/token/session-cookie/OTP/security-answer data appears in logs.
-16. Existing authentication/session/flow behavior remains unchanged.
+Unexpected exceptions should be logged once with:
 
-## Copilot prompt to use with this file
+SYSTEM_ERROR
+errorCode=INTERNAL_ERROR
+stack trace
+trackingId
+requestId when available
+realm/clientId/flow when available
 
-Use this prompt after adding this Markdown file to the repository:
+SECURITY / PRIVACY
 
-```text
-Read SSO_Splunk_Logging_Code_Change_Guide.md completely.
-Inspect the existing sso-backend implementation before changing code.
-Implement the guide incrementally using existing domain classes, existing error codes, existing logging infrastructure, and existing tests where possible.
-Do not change functional SSO behavior, API contracts, session semantics, CSRF/CORS/security configuration, or external login-service contracts.
-Do not log credentials, tokens, cookies, OTPs, session IDs, or raw PII.
-First show me the exact files you plan to create or modify and why. Then implement the changes file by file.
+Never log:
+
+- password
+- oldPassword
+- newPassword
+- confirmPassword
+- OTP
+- security answer
+- access token
+- refresh token
+- authorization code
+- Remember Me token
+- CSRF token
+- Cookie header
+- Authorization header
+- SSOSESSION value
+- HttpSession ID
+- raw sensitive external service payload
+- full recovery email/phone/account/SSN data
+
+Use the existing privacy-safe userKey approach where applicable.
+
+TRACKING ID VALIDATION
+
+Review RequestTrackingFilter.
+
+Continue supporting existing X-Tracking-Id and legacy transaction-ID behavior.
+
+If an incoming tracking ID is accepted, validate it with a conservative max length and safe character set before placing it in logs. Generate a UUID when missing/blank/invalid.
+
+Do not break any upstream tracing requirement already present in the application.
+
+FRONTEND CHECK
+
+Inspect SsoApiClient only to verify whether React is intentionally sending:
+
+X-Tracking-Id = requestId
+
+If it is, remove that coupling unless existing enterprise infrastructure explicitly requires it.
+
+The normal model should be:
+
+frontend sends requestId as business journey identifier
+backend/upstream generates trackingId for each HTTP request
+
+TESTS
+
+Add/update tests for at least:
+
+1. first /ssoAuthenticate:
+   - new session when absent
+   - new requestId
+   - previousRequestId absent
+
+2. second /ssoAuthenticate in same session:
+   - same HttpSession reused
+   - new requestId
+   - previousRequestId points to first request
+
+3. third request:
+   - REQ-3 previousRequestId points to REQ-2
+
+4. multiple requestIds remain stored and independently usable
+
+5. RequestTrackingFilter:
+   - generates trackingId
+   - accepts valid incoming trackingId
+   - handles legacy header
+   - rejects/normalizes unsafe tracking ID
+   - writes response header
+   - clears MDC
+
+6. MdcContextService:
+   - requestId
+   - previousRequestId
+   - realm
+   - clientId
+   - flow
+   - userKey
+   - externalService
+   are properly cleared
+
+7. same-realm session reuse continues working
+
+8. cross-realm reuse continues working
+
+9. Remember Me continues working
+
+10. flow behavior remains unchanged
+
+11. logs do not expose passwords/tokens/session values
+
+12. existing tests remain green
+
+DO NOT CHANGE
+
+Do not change functional behavior for:
+
+- GemFire/Spring Session
+- session timeout
+- realm timeout
+- requestId generation
+- authorization request storage
+- active journey storage
+- request-user binding
+- cross-realm rules
+- Remember Me
+- external login contract
+- Transmit contract
+- CSRF
+- CORS
+- Spring Security authorization
+- redirect URI validation
+- realm/client validation
+- controller request/response contract
+- React flow contract
+
+SPLUNK RESULT REQUIRED
+
+After implementation, these searches must be supported by structured fields.
+
+Single journey:
+
+index=sso_prod requestId="<request-id>"
+| sort _time
+
+Repeated SSO calls:
+
+index=sso_prod requestId IN ("REQ-1001","REQ-2002")
+| sort _time
+| table _time trackingId requestId previousRequestId eventCode realm clientId flow result errorCode durationMs
+
+Flow dashboard:
+
+index=sso_prod eventCode="FLOW_STARTED"
+| chart count over realm by flow
+
+Failures:
+
+index=sso_prod eventCode IN ("FLOW_FAILED","SSO_REQUEST_FAILED","EXTERNAL_CALL_FAILED")
+| stats count by realm errorCode
+
+End-to-end latency:
+
+index=sso_prod eventCode="SSO_REQUEST_COMPLETED"
+| stats avg(durationMs) perc95(durationMs) perc99(durationMs) by realm
+
+FINAL OUTPUT FROM COPILOT
+
+After implementation:
+
+1. Show all files changed.
+2. Explain the purpose of each change.
+3. Show the final MDC ownership model.
+4. Show the final requestId/trackingId/previousRequestId lifecycle.
+5. Show example logs for:
+   - first SSO request
+   - second SSO request in same session
+   - same-realm reuse
+   - failed authentication
+   - Forgot Password
+   - Transmit
+6. List tests added/modified.
+7. Run tests/build.
+8. Report any failing tests or unresolved concerns.
+9. Do not claim completion if the project does not compile or tests fail.
 ```
