@@ -1,27 +1,11 @@
-type Args = {
-  error: any;
+import type {
+  ApiError,
+  ErrorCode,
+} from "@company/sso-auth-core";
 
-  setUsernameError:
-    (message: string) => void;
-
-  setPasswordError:
-    (message: string) => void;
-
-  setLoginError:
-    (message: string) => void;
-
-  onError:
-    (error: unknown) => void;
-};
-
-
-export function handleAuthenticateError({
-  error,
-  setUsernameError,
-  setPasswordError,
-  setLoginError,
-  onError,
-}: Args): void {
+export function handleServiceError(
+  error: any
+): ApiError {
 
   const status =
     error?.response?.status;
@@ -29,121 +13,92 @@ export function handleAuthenticateError({
   const data =
     error?.response?.data;
 
-  const code =
-    data?.code;
+  const backendMessage =
+    typeof data?.message === "string"
+      ? data.message
+      : undefined;
 
-  const message =
-    data?.message;
-
-  const fieldErrors =
-    data?.fieldErrors;
-
-
-  // ==========================
-  // VALIDATION ERROR
-  // ==========================
-  if (code === "VALIDATION_ERROR") {
-
-    if (Array.isArray(fieldErrors)) {
-
-      const usernameError =
-        fieldErrors.find(
-          (item) =>
-            item.field === "username"
-        );
-
-      const passwordError =
-        fieldErrors.find(
-          (item) =>
-            item.field === "password"
-        );
+  const trackingId =
+    typeof data?.trackingId === "string"
+      ? data.trackingId
+      : undefined;
 
 
-      if (usernameError) {
-        setUsernameError(
-          usernameError.message
-        );
-      }
-
-
-      if (passwordError) {
-        setPasswordError(
-          passwordError.message
-        );
-      }
-
-
-      // No field-specific error
-      if (
-        !usernameError &&
-        !passwordError
-      ) {
-
-        setLoginError(
-          typeof message === "string"
-            ? message
-            : "Please check your information."
-        );
-      }
-    }
-
-    return;
+  if (!error?.response) {
+    return {
+      code: "NETWORK_ERROR",
+      message:
+        "Unable to connect to the service. Please try again.",
+      trackingId,
+    };
   }
 
 
-  // ==========================
-  // INVALID CREDENTIALS
-  // ==========================
+  if (status === 403) {
+    return {
+      status,
+      code: "ACCESS_DENIED",
+      message:
+        backendMessage ||
+        "You are not authorized to perform this action.",
+      trackingId,
+    };
+  }
+
+
   if (
-    status === 401 ||
-    code === "INVALID_CREDENTIALS"
+    status === 502 ||
+    status === 503
   ) {
-
-    setLoginError(
-      typeof message === "string"
-        ? message
-        : "Username or password is incorrect."
-    );
-
-    return;
+    return {
+      status,
+      code: "SERVICE_UNAVAILABLE",
+      message:
+        backendMessage ||
+        "Service is temporarily unavailable. Please try again.",
+      trackingId,
+    };
   }
 
 
-  // ==========================
-  // ACCOUNT LOCKED
-  // ==========================
-  if (
-    status === 423 ||
-    code === "ACCOUNT_LOCKED"
-  ) {
-
-    setLoginError(
-      typeof message === "string"
-        ? message
-        : "Your account is locked."
-    );
-
-    return;
+  if (status >= 500) {
+    return {
+      status,
+      code: "INTERNAL_ERROR",
+      message:
+        backendMessage ||
+        "Something went wrong. Please try again.",
+      trackingId,
+    };
   }
 
 
-  // ==========================
-  // SYSTEM ERROR -> SHELL
-  // ==========================
-  onError(error);
+  return {
+    status,
+    code:
+      (typeof data?.code === "string"
+        ? data.code
+        : "INTERNAL_ERROR") as ErrorCode,
+
+    message:
+      backendMessage ||
+      "Something went wrong. Please try again.",
+
+    trackingId,
+  };
 }
 
-=======
-  export interface FieldError {
-  field: string;
-  message: string;
-}
+===============================================
+  const [serverError, setServerError] =
+  useState<ApiError | null>(null);
 
-export interface ApiError {
-  status?: number;
-  code: ErrorCode;
-  message: string;
-  trackingId?: string;
-
-  fieldErrors?: FieldError[];
+if (serverError) {
+  return (
+    <ServiceError
+      error={serverError}
+      onRetry={() => {
+        setServerError(null);
+      }}
+    />
+  );
 }
