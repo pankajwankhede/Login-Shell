@@ -1,12 +1,19 @@
 type Args = {
   error: any;
 
-  setUsernameError: (message: string) => void;
-  setPasswordError: (message: string) => void;
-  setLoginError: (message: string) => void;
+  setUsernameError:
+    (message: string) => void;
 
-  onError: (error: unknown) => void;
+  setPasswordError:
+    (message: string) => void;
+
+  setLoginError:
+    (message: string) => void;
+
+  onError:
+    (error: unknown) => void;
 };
+
 
 export function handleAuthenticateError({
   error,
@@ -32,39 +39,61 @@ export function handleAuthenticateError({
     data?.fieldErrors;
 
 
-  // 1. BACKEND FIELD VALIDATION
+  // ==========================
+  // VALIDATION ERROR
+  // ==========================
   if (code === "VALIDATION_ERROR") {
 
-    if (fieldErrors?.username) {
-      setUsernameError(
-        fieldErrors.username
-      );
-    }
+    if (Array.isArray(fieldErrors)) {
 
-    if (fieldErrors?.password) {
-      setPasswordError(
-        fieldErrors.password
-      );
-    }
+      const usernameError =
+        fieldErrors.find(
+          (item) =>
+            item.field === "username"
+        );
 
-    // Validation error without
-    // specific field errors
-    if (
-      !fieldErrors?.username &&
-      !fieldErrors?.password
-    ) {
-      setLoginError(
-        typeof message === "string"
-          ? message
-          : "Please check your information."
-      );
+      const passwordError =
+        fieldErrors.find(
+          (item) =>
+            item.field === "password"
+        );
+
+
+      if (usernameError) {
+        setUsernameError(
+          usernameError.message
+        );
+      }
+
+
+      if (passwordError) {
+        setPasswordError(
+          passwordError.message
+        );
+      }
+
+
+      // No field-specific error
+      if (
+        !usernameError &&
+        !passwordError
+      ) {
+
+        setLoginError(
+          typeof message === "string"
+            ? message
+            : "Please check your information."
+        );
+      }
     }
 
     return;
   }
 
 
-  // 2. INVALID CREDENTIALS
+  // ==========================
+  // INVALID CREDENTIALS
+  // ==========================
   if (
     status === 401 ||
     code === "INVALID_CREDENTIALS"
@@ -80,7 +109,9 @@ export function handleAuthenticateError({
   }
 
 
-  // 3. ACCOUNT LOCKED
+  // ==========================
+  // ACCOUNT LOCKED
+  // ==========================
   if (
     status === 423 ||
     code === "ACCOUNT_LOCKED"
@@ -96,6 +127,23 @@ export function handleAuthenticateError({
   }
 
 
-  // 4. SYSTEM / SERVICE ERROR
+  // ==========================
+  // SYSTEM ERROR -> SHELL
+  // ==========================
   onError(error);
+}
+
+=======
+  export interface FieldError {
+  field: string;
+  message: string;
+}
+
+export interface ApiError {
+  status?: number;
+  code: ErrorCode;
+  message: string;
+  trackingId?: string;
+
+  fieldErrors?: FieldError[];
 }
