@@ -1,3 +1,29 @@
+const defaultUiConfig = {
+  pageTitle: "Secure Login",
+  logoUrl: "/logo.svg",
+  logoAlt: "Company",
+  headerTitle: "Secure Login",
+  headerLinks: [],
+  footerLinks: [],
+  approvedScriptIds: [],
+};
+
+Then:
+
+if (!b && serverError) {
+
+  return (
+    <PublicLayout
+      config={defaultUiConfig}
+    >
+      <ServiceError
+        error={serverError}
+      />
+    </PublicLayout>
+  );
+}
+
+================
 import type {
   ApiError,
   ErrorCode,
@@ -13,92 +39,23 @@ export function handleServiceError(
   const data =
     error?.response?.data;
 
-  const backendMessage =
+  const code =
+    typeof data?.code === "string"
+      ? data.code
+      : "INTERNAL_ERROR";
+
+  const message =
     typeof data?.message === "string"
       ? data.message
-      : undefined;
-
-  const trackingId =
-    typeof data?.trackingId === "string"
-      ? data.trackingId
-      : undefined;
-
-
-  if (!error?.response) {
-    return {
-      code: "NETWORK_ERROR",
-      message:
-        "Unable to connect to the service. Please try again.",
-      trackingId,
-    };
-  }
-
-
-  if (status === 403) {
-    return {
-      status,
-      code: "ACCESS_DENIED",
-      message:
-        backendMessage ||
-        "You are not authorized to perform this action.",
-      trackingId,
-    };
-  }
-
-
-  if (
-    status === 502 ||
-    status === 503
-  ) {
-    return {
-      status,
-      code: "SERVICE_UNAVAILABLE",
-      message:
-        backendMessage ||
-        "Service is temporarily unavailable. Please try again.",
-      trackingId,
-    };
-  }
-
-
-  if (status >= 500) {
-    return {
-      status,
-      code: "INTERNAL_ERROR",
-      message:
-        backendMessage ||
-        "Something went wrong. Please try again.",
-      trackingId,
-    };
-  }
-
+      : "Something went wrong. Please try again.";
 
   return {
     status,
-    code:
-      (typeof data?.code === "string"
-        ? data.code
-        : "INTERNAL_ERROR") as ErrorCode,
-
-    message:
-      backendMessage ||
-      "Something went wrong. Please try again.",
-
-    trackingId,
+    code: code as ErrorCode,
+    message,
+    trackingId:
+      typeof data?.trackingId === "string"
+        ? data.trackingId
+        : undefined,
   };
-}
-
-===============================================
-  const [serverError, setServerError] =
-  useState<ApiError | null>(null);
-
-if (serverError) {
-  return (
-    <ServiceError
-      error={serverError}
-      onRetry={() => {
-        setServerError(null);
-      }}
-    />
-  );
 }
