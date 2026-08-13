@@ -1,59 +1,51 @@
-Do NOT create a new Axios client in the SSO Shell App.
+We identified the deployment problem.
 
-The project already contains a dedicated package/module:
-sso-auth-api-client
+vite.config.ts currently has:
 
-It already owns the AxiosInstance and all SSO backend communication.
+server.proxy:
+  /api -> shell-sso-service
+  /login/ssoAuthenticate -> shell-sso-service
 
-Use and modify this existing module.
+This works only for the Vite development server.
 
-First inspect:
+It does NOT proxy requests after the generated dist folder is deployed to PCF Staticfile/nginx.
 
-sso-auth-api-client/src/index.ts
-sso-auth-api-client/src/normalizeApiError.tsx
-its AuthApi interface/types
-all request/response DTOs
-package consumers in the shell app
+Production network confirms:
 
-Existing Axios setup already has:
+shell-sso-ui.../api/auth/bootstrap/{requestId}
+returns:
+200 text/html from nginx
+
+Therefore do not try to solve the PCF issue by changing only vite.config.ts.
+
+Analyze:
+
+1. where SsoApiClient is instantiated in the shell
+2. whether SsoApiClient receives baseURL
+3. existing .env files
+4. Jenkins/build-time environment handling
+5. whether the application uses build-time VITE_* variables or runtime configuration
+6. whether the same dist artifact is promoted between DEV/QA/UAT/PROD
+
+Desired behavior:
+
+LOCAL:
+SsoApiClient baseURL = /api/auth
+Vite dev proxy routes /api to backend.
+
+DEPLOYED DEV:
+SsoApiClient baseURL =
+https://shell-sso-service.app.dev1.use1.pcf.syfbank.com/api/auth
+
+DEPLOYED QA/UAT/PROD:
+use the corresponding backend URL through the existing environment configuration mechanism.
+
+Do not create another Axios client.
+Continue using sso-auth-api-client.
+
+Preserve:
 withCredentials: true
 xsrfCookieName: XSRF-TOKEN
 xsrfHeaderName: X-XSRF-TOKEN
 
-Preserve those.
-
-Do not create:
-src/services/api/ssoClient.ts
-src/services/api/bootstrapApi.ts
-
-in the shell app unless there is a proven missing requirement.
-
-Required changes should primarily be made in sso-auth-api-client:
-
-- bootstrap(requestId)
-- authenticate
-- forgot password APIs
-- forgot username APIs
-- password-expired update
-- profile update
-- transmit APIs
-- requestId propagation
-- normalizeApiError if required
-
-The shell app should only:
-- obtain requestId from route
-- call SsoApiClient
-- manage loading
-- select/render flow module
-- display shell-level service errors
-
-Before changing code, show:
-1. current AuthApi interface
-2. current SsoApiClient implementation
-3. current request DTOs
-4. which methods already send requestId
-5. which methods need requestId added
-6. how the shell currently constructs SsoApiClient
-7. whether baseURL is already injected/configured
-
-Then make the smallest possible changes.
+Before making changes, show me exactly how environment values are currently injected at build/runtime and identify the smallest required code/config changes.
