@@ -1,51 +1,78 @@
-We identified the deployment problem.
+We are currently testing directly on PCF before implementing production Nginx routing.
 
-vite.config.ts currently has:
+Frontend PCF URL:
+https://shell-sso-ui.app.dev1.use1.pcf.syfbank.com
 
-server.proxy:
-  /api -> shell-sso-service
-  /login/ssoAuthenticate -> shell-sso-service
+Backend PCF URL:
+https://shell-sso-service.app.dev1.use1.pcf.syfbank.com
 
-This works only for the Vite development server.
+The frontend uses staticfile_buildpack with:
 
-It does NOT proxy requests after the generated dist folder is deployed to PCF Staticfile/nginx.
+path: ./dist
 
-Production network confirms:
+Therefore the Vite server.proxy configuration is LOCAL DEVELOPMENT ONLY and is not available after cf push.
 
-shell-sso-ui.../api/auth/bootstrap/{requestId}
-returns:
-200 text/html from nginx
+Do not modify vite.config.ts as the production fix.
 
-Therefore do not try to solve the PCF issue by changing only vite.config.ts.
+Current deployed problem:
 
-Analyze:
+GET /api/auth/csrf
+and
+GET /api/auth/bootstrap/{requestId}
 
-1. where SsoApiClient is instantiated in the shell
-2. whether SsoApiClient receives baseURL
-3. existing .env files
-4. Jenkins/build-time environment handling
-5. whether the application uses build-time VITE_* variables or runtime configuration
-6. whether the same dist artifact is promoted between DEV/QA/UAT/PROD
+are going to shell-sso-ui and returning text/html from nginx.
 
-Desired behavior:
+They need to go directly to:
 
-LOCAL:
-SsoApiClient baseURL = /api/auth
-Vite dev proxy routes /api to backend.
+https://shell-sso-service.app.dev1.use1.pcf.syfbank.com/api/auth/csrf
 
-DEPLOYED DEV:
-SsoApiClient baseURL =
-https://shell-sso-service.app.dev1.use1.pcf.syfbank.com/api/auth
+and:
 
-DEPLOYED QA/UAT/PROD:
-use the corresponding backend URL through the existing environment configuration mechanism.
+https://shell-sso-service.app.dev1.use1.pcf.syfbank.com/api/auth/bootstrap/{requestId}
+
+The project already has sso-auth-api-client with SsoApiClient.
 
 Do not create another Axios client.
-Continue using sso-auth-api-client.
 
-Preserve:
+First inspect the Shell App and identify:
+
+1. where SsoApiClient is instantiated
+2. whether baseURL is passed to it
+3. how public/config.js is generated and consumed
+4. the contents/schema of runtime config.js
+5. whether an existing backend/api URL configuration already exists
+6. whether import.meta.env is currently used
+7. how the AuthApi instance is passed into App.tsx
+
+Prefer using the existing runtime config.js mechanism if it already exists.
+
+The target should be conceptually:
+
+const api = new SsoApiClient(config.apiBaseUrl);
+
+where DEV apiBaseUrl is:
+
+https://shell-sso-service.app.dev1.use1.pcf.syfbank.com/api/auth
+
+Preserve the existing SsoApiClient configuration:
+
 withCredentials: true
-xsrfCookieName: XSRF-TOKEN
-xsrfHeaderName: X-XSRF-TOKEN
+xsrfCookieName: "XSRF-TOKEN"
+xsrfHeaderName: "X-XSRF-TOKEN"
 
-Before making changes, show me exactly how environment values are currently injected at build/runtime and identify the smallest required code/config changes.
+Do not hardcode environment-specific PCF URLs inside the reusable sso-auth-api-client package.
+
+Do not create duplicate Axios clients.
+
+Do not modify individual API methods with separate absolute URLs.
+
+There must be one configurable base URL.
+
+Before changing code, show the exact existing files to modify and explain the current config.js flow.
+
+After implementation I will run:
+
+npm run build
+cf push -f manifest-dev-es1-dev1.yml
+
+and verify in Chrome Network that /csrf and /bootstrap requests go to shell-sso-service rather than shell-sso-ui.
